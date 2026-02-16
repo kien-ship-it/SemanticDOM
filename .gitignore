@@ -1,5 +1,6 @@
 # Ignore documentation folder
 .Documentation/
+.*
 
 # Node modules
 node_modules/

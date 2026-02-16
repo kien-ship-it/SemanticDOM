@@ -5,7 +5,7 @@
 **Project:** SemanticDOM  
 **Date:** February 2026 
 **Status:** Pending 
-**Parent Project:** Personal Information Agent (Privacy-First Content Filtering)  
+**Parent Project:** Personal Information Agent (Privacy-First and Democratized Content Filtering)  
 **Evaluation:** [See Section 13 — Evaluation & Risk Analysis](#13-evaluation--risk-analysis)
 
 ---

@@ -3,9 +3,10 @@
 ## Natural Language to DOM: A Semantic Selector Engine
 
 **Project:** SemanticDOM  
-**Date:** February 2026  
-**Status:** Proposal  
-**Parent Project:** Personal Information Agent (Privacy-First Content Filtering)
+**Date:** February 2026 
+**Status:** Pending 
+**Parent Project:** Personal Information Agent (Privacy-First Content Filtering)  
+**Evaluation:** [See Section 13 — Evaluation & Risk Analysis](#13-evaluation--risk-analysis)
 
 ---
 
@@ -132,10 +133,10 @@ The core library owns four responsibilities. Everything else is external.
 
 | Component | Responsibility | Notes |
 |---|---|---|
-| **Distiller** | `HTML string → Skeleton` | Strips `<script>`, `<style>`, SVGs, noisy attributes. Keeps structural tags + text snippets. Pure JS, no DOM APIs needed. |
+| **Distiller** | `HTML string → Skeleton` | Strips `<script>`, `<style>`, SVGs, noisy attributes. Keeps structural tags + text snippets. Uses a **Class Heuristic** to retain semantic classes (containing `post`, `title`, `item`, `card`, `wrapper`) while discarding utility classes (containing `p-`, `m-`, `flex`, `w-`, `h-`, `bg-`). Always preserves `aria-label`, `role`, and `id`. Pure JS, no DOM APIs needed. ⚠️ *This is the accuracy bottleneck — see [Section 13.2 Risk A](#132-technical-risks).* |
 | **Prompt Builder** | `Skeleton + Query → LLM Prompt` | Constructs the inference prompt. Handles retry prompts when validation fails. |
 | **Validator** | `CSS Selector → pass/fail` | Runs `querySelectorAll` (or a CSS parser in Node) to verify the selector is syntactically valid and matches elements. |
-| **Cache Manager** | `Domain → Query → Selector` | Stores and retrieves cached selectors. Adapter-agnostic (IndexedDB in browser, file/SQLite in Node). |
+| **Cache Manager** | `Domain → Query → Selector` | Stores and retrieves cached selectors. Stores the **original user intent** (natural language query) alongside the selector so the self-healing loop can re-run inference automatically when a cached selector goes stale. Adapter-agnostic (IndexedDB in browser, file/SQLite in Node). |
 
 ### 4.3 Provider Interface
 
@@ -149,10 +150,15 @@ interface SemanticProvider {
   /** Send a prompt, get text back */
   complete(prompt: string): Promise<string>;
 
+  /** Optional: abort an in-flight inference (e.g., user navigates away) */
+  cancel?(): Promise<void>;
+
   /** Optional: cleanup resources */
   dispose?(): Promise<void>;
 }
 ```
+
+> **Design Note (from evaluation):** The `cancel()` method was added to allow aborting GPU inference when the user navigates away mid-query. Without this, the WebGPU process would continue burning resources on a stale request.
 
 Built-in providers:
 
@@ -261,9 +267,33 @@ sequenceDiagram
 Running the LLM on every page load is too slow and battery-intensive. The core innovation is a **Cache & Self-Heal** loop:
 
 1. **First Visit:** LLM analyzes the page structure (~1-2s). Returns a CSS selector.
-2. **Cache:** Selector is saved per domain (e.g., `reddit.com → { "post title": ".post-title" }`).
+2. **Cache:** Selector is saved per domain (e.g., `reddit.com → { "post title": ".post-title" }`). The original user intent (natural language query) is stored alongside the selector to enable automatic re-inference.
 3. **Subsequent Visits:** Cached selector is applied instantly (< 10ms).
-4. **Self-Healing:** If `querySelectorAll` returns empty (site redesigned), the LLM re-runs in the background to discover the new selector. No user intervention needed.
+4. **Self-Healing:** If `querySelectorAll` returns empty (site redesigned), the LLM re-runs in the background using the stored intent to discover the new selector. No user intervention needed.
+
+### 5.1 Cold Start Strategy (Hybrid Cloud → Local)
+
+> **Added from evaluation feedback.** The 2GB model download before first use is a high barrier to entry.
+
+Asking a user to download 2GB before they see anything work will cause drop-off. The solution is a **Hybrid Model** for first-run UX:
+
+1. **First Run (Cloud):** When the user installs the extension, use a cheap cloud API (OpenAI `gpt-4o-mini` or a hosted endpoint) for the first ~10 queries. This is instant and requires no download.
+2. **Background Download:** While the user is actively using the cloud-backed version, download the Phi-3.5 model in the background via Cache Storage.
+3. **Silent Switch:** Once the model is fully downloaded, silently swap the provider from `OpenAIProvider` → `WebLLMProvider`. The user never notices the transition.
+
+This validates the user's need ("this works") before asking for their storage space.
+
+```typescript
+// Cold start implementation sketch
+const engine = new SemanticSelector({
+  provider: new HybridProvider({
+    immediate: new OpenAIProvider({ model: 'gpt-4o-mini' }),  // instant, cloud
+    target: new WebLLMProvider({ model: 'phi-3.5-mini' }),     // local, downloads in background
+    switchAfterReady: true,
+  }),
+  cache: 'indexeddb',
+});
+```
 
 ---
 
@@ -327,20 +357,22 @@ graph LR
 ```
 
 
-### Phase 1 — Local Playground (Weeks 1-2)
+### Phase 1 — Local Playground & Distiller Tuning (Weeks 1-2)
 
-**Goal:** Prove that a small language model can reliably translate natural language → CSS selectors from distilled HTML.
+**Goal:** Prove that a small language model can reliably translate natural language → CSS selectors from distilled HTML. **Primary focus: get the Distiller right.** If the Distiller is bad, the best AI model will fail.
 
 **Environment:** Vite web app on `localhost:3000`. No extension complexity.
 
 | Week | Deliverable |
 |---|---|
-| 1 | Project scaffolding. DOM Distiller v1 (strip `<script>`, `<style>`, SVGs). WebLLM integration with Phi-3.5 Mini. Basic prompt engineering. |
-| 2 | Prompt refinement against 5+ real sites (Reddit, HN, Twitter, YouTube, Wikipedia). Validation loop for invalid selectors. Target: 90% accuracy. |
+| 1 | Project scaffolding. **DOM Distiller v1** with Class Heuristic (strip `<script>`, `<style>`, SVGs; keep semantic classes, discard utility classes; preserve `aria-label`, `role`, `id`). Scrape 10 popular sites (Reddit, Twitter, Amazon, Wikipedia, NYTimes, HN, YouTube, GitHub, Medium, StackOverflow) and output skeleton HTML. **Manual validation:** feed skeletons to ChatGPT — if it can't find the selector, Phi-3 won't either. Tune Distiller until ChatGPT gets 10/10. WebLLM integration with Phi-3.5 Mini. Basic prompt engineering. |
+| 2 | Prompt refinement against 5+ real sites. Validation loop for invalid selectors. **Confidence scoring via match-count heuristic** (see Section 9.2). Target: 90% accuracy. |
 
 **Success Metric:** Consistently returns valid CSS selectors for common page elements across 5 different websites.
 
 **Key Risk:** Model hallucinating invalid CSS syntax. Mitigated by validation loop + constrained output format.
+
+> **Evaluation note:** 80% of Phase 1 effort should go into the Distiller. The LLM integration is the easy part — the quality of the skeleton HTML is the bottleneck for accuracy.
 
 ---
 
@@ -350,27 +382,29 @@ graph LR
 
 | Day | Deliverable |
 |---|---|
-| 1-2 | Extension scaffolding. Manifest V3 setup. Content script injection. Popup UI. |
+| 1-2 | Extension scaffolding. Manifest V3 setup. Content script injection. Popup UI. **Test CSP + WebGPU in offscreen document immediately** (key risk). |
 | 3-4 | Offscreen document (`brain.html`). WebLLM in offscreen context. Chrome messaging bridge. |
-| 5-7 | Model download UX (progress bar, Cache Storage). End-to-end integration: query → distill → infer → highlight. |
+| 5-7 | Model download UX (progress bar, Cache Storage). End-to-end integration: query → distill → infer → highlight. **Optimistic loading state:** show spinner on extension icon during inference; do not modify DOM until selector is confirmed. Optionally, try instant regex match on common patterns (`article`, `[role="article"]`) while AI confirms the specific selector in the background. |
 
 **Success Metric:** Extension works on Reddit and Hacker News. User types "post title" and sees correct elements highlighted.
 
 **Key Risk:** CSP blocking WebGPU in offscreen document. Mitigated by testing early on Day 1.
 
+> **Evaluation note (Layout Shift UX):** On first visit, there is a ~2s lag while the AI finds the selector. If the user starts reading and content suddenly vanishes or highlights, it feels broken. The "Optimistic Loading State" pattern prevents this — never modify the DOM until the selector is confirmed.
+
 ---
 
 ### Phase 3 — Cache & Self-Heal (Week 4)
 
-**Goal:** Make it fast for repeat visits and resilient to site redesigns.
+**Goal:** Make it fast for repeat visits and resilient to site redesigns and dynamic content.
 
 | Day | Deliverable |
 |---|---|
-| 1-2 | Selector caching system. Domain → query → selector mappings in IndexedDB. Instant application on cached sites. |
-| 3-5 | Self-healing logic. Detect stale selectors, trigger background re-inference. |
+| 1-2 | Selector caching system. Domain → query → selector mappings in IndexedDB. **Store original user intent alongside selector** for automatic re-inference. Instant application on cached sites. |
+| 3-5 | Self-healing logic. Detect stale selectors, trigger background re-inference using stored intent. **MutationObserver** in Content Script to re-apply cached selectors on dynamically loaded DOM nodes (critical for SPAs like Twitter). Only re-run the cached selector on new nodes — do not re-run the AI. |
 | 6-7 | Multi-query support per site (e.g., "post title" + "comment body" + "vote count"). |
 
-**Success Metric:** Cached selectors apply in < 10ms. Self-healing recovers from a simulated site redesign within one page load.
+**Success Metric:** Cached selectors apply in < 10ms. Self-healing recovers from a simulated site redesign within one page load. Dynamic content (infinite scroll) is handled without re-inference.
 
 ---
 
@@ -462,6 +496,19 @@ const nodes = await engine.select("post titles");
 nodes.forEach(el => el.style.border = '2px solid red');
 ```
 
+**Confidence Score — Verification-Based Approach:**
+
+Rather than extracting raw logits from the model (complex and provider-dependent), confidence is derived from the Validator's match count:
+
+| Match Count | Confidence | Interpretation |
+|---|---|---|
+| 0 matches | `0.0` | Fail — selector is invalid or site redesigned |
+| 1 match | `0.5` | Ambiguous — could be a unique element (title) or a false positive (footer) |
+| 10-50 matches | `1.0` | Strong — looks like a feed or repeated element |
+| 500+ matches | `0.2` | Too generic — likely matched `div` or `span` |
+
+> This heuristic is simple, provider-agnostic, and works without access to model internals.
+
 ### 9.3 MCP Tool Interface
 
 ```typescript
@@ -536,5 +583,5 @@ These belong to the broader Personal Information Agent project but are explicitl
 
 1. **Model selection finalization:** Should we default to Phi-3.5 Mini (better reasoning, ~2GB) or Llama-3.2 1B (lighter, ~800MB)? Needs benchmarking in Phase 1.
 2. **Shadow DOM handling:** How deep should the distiller traverse shadow roots? Some modern frameworks (Lit, Salesforce Lightning) rely heavily on shadow DOM.
-3. **Dynamic content (SPAs):** Sites like Twitter load content dynamically. Should the Eye use a MutationObserver to re-apply selectors on new DOM nodes?
-4. **Selector specificity:** When the model returns a selector that matches too many or too few elements, what's the retry strategy? Prompt refinement vs. interactive narrowing?
+3. ~~**Dynamic content (SPAs):** Sites like Twitter load content dynamically. Should the Eye use a MutationObserver to re-apply selectors on new DOM nodes?~~ **→ Resolved: Yes, MutationObserver is required.** Promoted to a Phase 3 deliverable. The Eye re-applies cached selectors on new nodes only — no AI re-inference needed. See Phase 3 updates.
+4. **Selector specificity:** When the model returns a selector that matches too many or too few elements, what's the retry strategy? **→ Partially resolved:** The confidence score heuristic (Section 9.2) detects over-matching (500+ → confidence 0.2) and under-matching (0 → confidence 0.0). Retry strategy: prompt refinement with the match count as feedback to the LLM. Interactive narrowing deferred to v2.

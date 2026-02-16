@@ -5,7 +5,7 @@
 **Project:** SemanticDOM  
 **Date:** February 2026  
 **Status:** Proposal  
-**Parent Project:** Personal Information Agent (Privacy-First Content Filtering)
+**Parent Project:** Personal Information Agent (Privacy-First and Democratized Content Filtering)
 
 ---
 

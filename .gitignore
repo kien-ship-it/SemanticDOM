@@ -1,6 +1,6 @@
 # Ignore documentation folder
 .Documentation/
-.*
+
 
 # Node modules
 node_modules/
@@ -12,6 +12,9 @@ build/
 # Environment files
 .env
 .env.local
+
+# Virtual environment
+.venv/
 
 # IDE
 .vscode/

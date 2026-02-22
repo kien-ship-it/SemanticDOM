@@ -6,6 +6,21 @@ import { parseSelectorsFromResponse, validateSelectors } from './selector-parser
 import { injectHighlightStyles } from './style-injector.js';
 import { writeOutputHTML } from './html-writer.js';
 
+// ── Logging helpers ──────────────────────────────────────────────
+
+const STEP = '▶';
+const OK = '✔';
+const WARN = '⚠';
+const FAIL = '✖';
+const INFO = 'ℹ';
+const SEP = '─'.repeat(50);
+
+function logStep(msg) { console.log(`\n${STEP}  ${msg}`); }
+function logOk(msg) { console.log(`  ${OK}  ${msg}`); }
+function logWarn(msg) { console.log(`  ${WARN}  ${msg}`); }
+function logFail(msg) { console.error(`  ${FAIL}  ${msg}`); }
+function logInfo(msg) { console.log(`  ${INFO}  ${msg}`); }
+
 /**
  * Prompt the user for input via readline.
  * @param {string} query - The prompt text
@@ -31,9 +46,19 @@ export function isEmptyDescription(description) {
 }
 
 async function main() {
+    console.log(`\n${SEP}`);
+    console.log('  Semantic DOM Highlighter');
+    console.log(SEP);
+
+    // ── Step: Validate environment ───────────────────────────────
+    logStep('Validating environment...');
     validateEnv();
+    logOk('Environment variables loaded');
 
     const useDistiller = process.argv.includes('--distill');
+    if (useDistiller) {
+        logInfo('Distillation mode enabled (--distill)');
+    }
 
     // Conditionally load the distiller module
     let distill;
@@ -42,82 +67,112 @@ async function main() {
             const mod = await import('./distiller.js');
             distill = mod.distill;
             if (typeof distill !== 'function') {
-                console.error('Distiller module does not export a distill() function. Running without distillation.');
+                logWarn('Distiller module does not export a distill() function. Running without distillation.');
                 distill = null;
             }
         } catch {
-            console.error('Failed to load distiller module. Running without distillation.');
+            logWarn('Failed to load distiller module. Running without distillation.');
             distill = null;
         }
     }
 
     while (true) {
-        // Re-read source HTML each iteration to pick up changes
+        console.log(`\n${SEP}`);
+
+        // ── Step: Ingest HTML ────────────────────────────────────
+        logStep('Reading source HTML...');
         let source;
         try {
             source = await readSourceHTML();
         } catch (err) {
-            console.error(err.message);
+            logFail(err.message);
             process.exit(1);
         }
+        logOk(`Loaded ${source.filePath} (${(source.content.length / 1024).toFixed(1)} KB)`);
 
-        console.log(`Loaded: ${source.filePath}`);
-
-        // Prompt for semantic description
-        const description = await promptUser('Describe elements to highlight: ');
+        // ── Step: User input ─────────────────────────────────────
+        logStep('Waiting for user input...');
+        const description = await promptUser('  Describe elements to highlight: ');
 
         // Handle exit/quit
         const trimmed = description.trim().toLowerCase();
-        if (trimmed === 'exit' || trimmed === 'quit') break;
+        if (trimmed === 'exit' || trimmed === 'quit') {
+            logInfo('Exiting. Goodbye!');
+            break;
+        }
 
         // Reject empty/whitespace input
         if (isEmptyDescription(description)) {
-            console.log('Please enter a non-empty description.');
+            logWarn('Empty description — please enter a non-empty description.');
             continue;
         }
+        logOk(`Description: "${description.trim()}"`);
 
-        // Optional distillation step
+        // ── Step: Distillation (optional) ────────────────────────
         let htmlForPrompt = source.content;
         let isDistilled = false;
         if (useDistiller && distill) {
+            logStep('Distilling HTML...');
             htmlForPrompt = distill(source.content);
             isDistilled = true;
-            console.log(`Distilled: ${source.content.length} → ${htmlForPrompt.length} chars`);
+            const reduction = ((1 - htmlForPrompt.length / source.content.length) * 100).toFixed(1);
+            logOk(`Distilled: ${source.content.length} → ${htmlForPrompt.length} chars (${reduction}% reduction)`);
         }
 
-        // Build prompt and call LLM
+        // ── Step: Build prompt ───────────────────────────────────
+        logStep('Building LLM prompt...');
         const { systemPrompt, userPrompt } = buildPrompt(htmlForPrompt, description, { isDistilled });
+        logOk(`Prompt built (system: ${systemPrompt.length} chars, user: ${userPrompt.length} chars)`);
 
+        // ── Step: Call LLM ───────────────────────────────────────
+        logStep('Calling Azure OpenAI...');
+        const llmStart = Date.now();
         let llmResponse;
         try {
             llmResponse = await callLLM(systemPrompt, userPrompt);
         } catch (err) {
-            console.error(`LLM error: ${err.message}`);
+            logFail(`LLM error: ${err.message}`);
             process.exit(1);
         }
+        const llmDuration = ((Date.now() - llmStart) / 1000).toFixed(2);
+        logOk(`LLM responded in ${llmDuration}s (${llmResponse.length} chars)`);
 
-        // Parse selectors from response
+        // ── Step: Parse selectors ────────────────────────────────
+        logStep('Parsing selectors from response...');
         const parsed = parseSelectorsFromResponse(llmResponse);
         if (!parsed) {
-            console.log('Could not parse valid selectors from LLM response.');
+            logFail('Could not parse valid selectors from LLM response.');
             continue;
         }
+        logOk(`Parsed ${parsed.selectors.length} selector(s): ${parsed.selectors.join(', ')}`);
 
-        // Always validate against original source HTML
+        // ── Step: Validate selectors ─────────────────────────────
+        logStep('Validating selectors against source HTML...');
         const validated = validateSelectors(parsed.selectors, source.content);
         if (validated.length === 0) {
-            console.log('No matching elements found.');
+            logWarn('No selectors matched any elements.');
             continue;
         }
+        for (const v of validated) {
+            logInfo(`"${v.selector}" → ${v.matchCount} element(s)`);
+        }
+        logOk(`${validated.length}/${parsed.selectors.length} selector(s) valid`);
 
-        // Inject highlight styles and write output
+        // ── Step: Inject highlight styles ────────────────────────
+        logStep('Injecting highlight styles...');
         const { html, totalHighlighted } = injectHighlightStyles(
             source.content,
             validated.map((v) => v.selector)
         );
-        const outputPath = await writeOutputHTML(html);
+        logOk(`Highlighted ${totalHighlighted} element(s)`);
 
-        console.log(`Highlighted ${totalHighlighted} elements → ${outputPath}`);
+        // ── Step: Write output ───────────────────────────────────
+        logStep('Writing output HTML...');
+        const outputPath = await writeOutputHTML(html);
+        logOk(`Output written → ${outputPath}`);
+
+        // ── Done ─────────────────────────────────────────────────
+        console.log(`\n  🎯 Done — ${totalHighlighted} element(s) highlighted`);
     }
 }
 
